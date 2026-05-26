@@ -7,7 +7,7 @@ import (
 
 	"github.com/caddyserver/ingress/internal/k8s"
 	"go.uber.org/zap"
-	"gopkg.in/go-playground/pool.v3"
+	"golang.org/x/sync/errgroup"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -42,10 +42,8 @@ func (c *CaddyController) syncStatus(ings []*networkingv1.Ingress) error {
 // updateIngStatuses starts a queue and adds all monitored ingresses to update their status source address to the on
 // that the ingress controller is running on. This is called by the syncStatus queue.
 func (c *CaddyController) updateIngStatuses(controllerAddresses []networkingv1.IngressLoadBalancerIngress, ings []*networkingv1.Ingress) {
-	p := pool.NewLimited(10)
-	defer p.Close()
-
-	batch := p.Batch()
+	var g errgroup.Group
+	g.SetLimit(10)
 	sort.SliceStable(controllerAddresses, lessLoadBalancerIngress(controllerAddresses))
 
 	for _, ing := range ings {
@@ -58,34 +56,28 @@ func (c *CaddyController) updateIngStatuses(controllerAddresses []networkingv1.I
 			continue
 		}
 
-		batch.Queue(runUpdate(c.logger, ing, controllerAddresses, c.kubeClient))
+		g.Go(runUpdate(c.logger, ing, controllerAddresses, c.kubeClient))
 	}
 
-	batch.QueueComplete()
-	batch.WaitAll()
+	_ = g.Wait()
 }
 
 // runUpdate updates the ingress status field.
-func runUpdate(logger *zap.SugaredLogger, ing *networkingv1.Ingress, status []networkingv1.IngressLoadBalancerIngress, client *kubernetes.Clientset) pool.WorkFunc {
-	return func(wu pool.WorkUnit) (any, error) {
-		if wu.IsCancelled() {
-			return nil, nil
-		}
-
+func runUpdate(logger *zap.SugaredLogger, ing *networkingv1.Ingress, status []networkingv1.IngressLoadBalancerIngress, client *kubernetes.Clientset) func() error {
+	return func() error {
 		updated, err := k8s.UpdateIngressStatus(client, ing, status)
 		if err != nil {
 			logger.Warnf("error updating ingress rule: %v", err)
-		} else {
-			logger.Debugf(
-				"updating Ingress %v/%v status from %v to %v",
-				ing.Namespace,
-				ing.Name,
-				ing.Status.LoadBalancer.Ingress,
-				updated.Status.LoadBalancer.Ingress,
-			)
+			return nil
 		}
-
-		return true, nil
+		logger.Debugf(
+			"updating Ingress %v/%v status from %v to %v",
+			ing.Namespace,
+			ing.Name,
+			ing.Status.LoadBalancer.Ingress,
+			updated.Status.LoadBalancer.Ingress,
+		)
+		return nil
 	}
 }
 

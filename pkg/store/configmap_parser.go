@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/mitchellh/mapstructure"
+	"github.com/go-viper/mapstructure/v2"
 	apiv1 "k8s.io/api/core/v1"
 )
 
