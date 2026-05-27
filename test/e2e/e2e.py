@@ -64,6 +64,15 @@ def cluster_exists(name: str) -> bool:
     return name in out.splitlines()
 
 
+def pull_and_retag(source: str) -> None:
+    # Accepts either a tag (repo:tag) or a digest (repo@sha256:...). We pull it
+    # and re-tag to the canonical local name so kind load + helm install work
+    # unchanged regardless of the reference form.
+    log(f"pulling pre-built image {source}")
+    run(["docker", "pull", source])
+    run(["docker", "tag", source, IMAGE])
+
+
 def build_image() -> None:
     log("building controller binary")
     env = {**os.environ, "CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": "amd64"}
@@ -240,9 +249,16 @@ def main() -> None:
                     help="do not delete the kind cluster on exit")
     ap.add_argument("--skip-build", action="store_true",
                     help="skip building the controller image (assumes IMAGE already exists)")
+    ap.add_argument("--image", default="",
+                    help="test a pre-built image (tag or repo@sha256 digest) instead of "
+                         "building from source; it is pulled and loaded into the cluster")
     args = ap.parse_args()
 
-    require_tools(["go", "docker", "kind", "kubectl", "helm"])
+    building = not args.image and not args.skip_build
+    tools = ["docker", "kind", "kubectl", "helm"]
+    if building:
+        tools.insert(0, "go")
+    require_tools(tools)
 
     def cleanup():
         for fn in reversed(_cleanup_fns):
@@ -254,7 +270,9 @@ def main() -> None:
 
     atexit.register(cleanup)
 
-    if not args.skip_build:
+    if args.image:
+        pull_and_retag(args.image)
+    elif not args.skip_build:
         build_image()
     create_cluster(args.cluster_name)
     load_image(args.cluster_name)
