@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/ingress/internal/caddy"
+	_ "github.com/caddyserver/ingress/internal/caddy/logging/otlp"
 	"github.com/caddyserver/ingress/internal/controller"
 	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"

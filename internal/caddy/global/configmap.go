@@ -2,10 +2,12 @@ package global
 
 import (
 	"encoding/json"
+	"os"
 
 	caddy2 "github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"github.com/caddyserver/ingress/internal/caddy/logging/otlp"
 	"github.com/caddyserver/ingress/pkg/converter"
 	"github.com/caddyserver/ingress/pkg/store"
 	"github.com/mholt/acmez/v3/acme"
@@ -30,8 +32,15 @@ func (p ConfigMapPlugin) GlobalHandler(config *converter.Config, store *store.St
 	tlsApp := config.GetTLSApp()
 	httpServer := config.GetHTTPServer()
 
+	defaultLog := &caddy2.CustomLog{}
 	if cfgMap.Debug {
-		config.Logging.Logs = map[string]*caddy2.CustomLog{"default": {BaseLog: caddy2.BaseLog{Level: "DEBUG"}}}
+		defaultLog.BaseLog = caddy2.BaseLog{Level: "DEBUG"}
+	}
+	if os.Getenv("OTEL_LOGS_EXPORTER") == "otlp" {
+		defaultLog.BaseLog.WriterRaw = caddyconfig.JSONModuleObject(otlp.Writer{}, "output", "otlp", nil)
+	}
+	if cfgMap.Debug || defaultLog.BaseLog.WriterRaw != nil {
+		config.Logging.Logs = map[string]*caddy2.CustomLog{"default": defaultLog}
 	}
 
 	if cfgMap.AcmeCA != "" || cfgMap.Email != "" {

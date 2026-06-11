@@ -80,6 +80,19 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template
   name: "caddy-ingress-controller"
 
+# Inject environment variables into the controller container via envFrom.
+# Intended for piping a configmap or secret of standard OpenTelemetry env
+# keys (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS,
+# OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_SERVICE_NAME, …) into the controller.
+# Setting OTEL_LOGS_EXPORTER=otlp inside the referenced source switches
+# Caddy's default log writer to OTLP so request/access logs are shipped
+# directly to an OTel-compatible backend.
+# Example:
+#   otelEnvFrom:
+#     - configMapRef:
+#         name: otel-env
+otelEnvFrom: []
+
 podAnnotations: {}
 
 podSecurityContext:
