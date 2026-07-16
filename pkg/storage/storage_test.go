@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -422,5 +423,30 @@ func TestCleanKeyProducesValidKubernetesNames(t *testing.T) {
 		if errs := validation.IsDNS1123Subdomain(got); len(errs) != 0 {
 			t.Errorf("cleanKey(%q, %q) = %q is not a valid kubernetes name: %v", tc.key, tc.prefix, got, errs)
 		}
+	}
+}
+
+func TestLockFailsFastOnValidationError(t *testing.T) {
+	s := newTestStorage(t)
+	fakeClient := s.kubeClient.(*fake.Clientset)
+	// The fake clientset does not validate object names, so simulate the
+	// apiserver's RFC 1123 rejection (the July outage failure mode).
+	fakeClient.PrependReactor("create", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInvalid(
+			schema.GroupKind{Group: "coordination.k8s.io", Kind: "Lease"},
+			"caddy-lock-ari.MixedCase", nil)
+	})
+
+	start := time.Now()
+	err := s.Lock(context.Background(), "ari_MixedCaseID")
+	if err == nil {
+		t.Fatal("Lock succeeded despite validation rejection")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("Lock error = %v, want an Invalid apierror", err)
+	}
+	// Must fail on the first attempt, not after retries/timeouts.
+	if elapsed := time.Since(start); elapsed > leasePollInterval {
+		t.Fatalf("Lock took %v to fail; expected immediate failure", elapsed)
 	}
 }

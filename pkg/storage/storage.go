@@ -257,6 +257,15 @@ func (s *SecretStorage) Lock(ctx context.Context, key string) error {
 			return nil
 		}
 
+		// Validation and bad-request rejections are deterministic: the
+		// apiserver will answer the same way on every retry, so waiting is
+		// pointless. Fail the operation immediately and visibly.
+		if apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) {
+			logger.Error("giving up on storage lock: request rejected by apiserver",
+				zap.Error(err))
+			return fmt.Errorf("acquiring lock %v: %w", leaseName, err)
+		}
+
 		if time.Since(start) >= lockAcquireTimeout {
 			logger.Error("giving up on storage lock: timeout",
 				zap.Error(err),
@@ -368,7 +377,7 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 	}
 
 	if err = lock.Update(ctx, ler); err != nil {
-		return true, fmt.Errorf("failed to update lock: %v", err)
+		return true, fmt.Errorf("failed to update lock: %w", err)
 	}
 	return false, nil
 }
