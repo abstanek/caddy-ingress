@@ -215,29 +215,44 @@ func (s *SecretStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo
 }
 
 func (s *SecretStorage) Lock(ctx context.Context, key string) error {
+	leaseName := cleanKey(key, leasePrefix)
+	logger := s.logger.With(zap.String("lock", leaseName))
+	logger.Debug("acquiring storage lock")
+
+	start := time.Now()
 	for {
-		_, err := s.tryAcquireOrRenew(ctx, cleanKey(key, leasePrefix), false)
+		_, err := s.tryAcquireOrRenew(ctx, leaseName, false)
 		if err == nil {
-			go s.keepLockUpdated(ctx, cleanKey(key, leasePrefix))
+			logger.Debug("storage lock acquired", zap.Duration("waited", time.Since(start)))
+			go s.keepLockUpdated(ctx, leaseName)
 			return nil
 		}
+
+		logger.Warn("storage lock not acquired; will retry",
+			zap.Error(err),
+			zap.Duration("waited", time.Since(start)))
 
 		select {
 		case <-time.After(leasePollInterval):
 		case <-ctx.Done():
+			logger.Warn("giving up on storage lock: context done",
+				zap.Duration("waited", time.Since(start)))
 			return ctx.Err()
 		}
 	}
 }
 
 func (s *SecretStorage) keepLockUpdated(ctx context.Context, key string) {
+	logger := s.logger.With(zap.String("lock", key))
 	for {
 		time.Sleep(leaseRenewInterval)
 		done, err := s.tryAcquireOrRenew(ctx, key, true)
 		if err != nil {
+			logger.Warn("stopping storage lock refresh due to error", zap.Error(err))
 			return
 		}
 		if done {
+			logger.Debug("storage lock released; stopping refresh")
 			return
 		}
 	}
@@ -306,6 +321,12 @@ func (s *SecretStorage) Unlock(ctx context.Context, key string) error {
 	// outlives its holder. The request is still bounded by the client's
 	// request timeout.
 	ctx = context.WithoutCancel(ctx)
-	err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Delete(ctx, cleanKey(key, leasePrefix), metav1.DeleteOptions{})
-	return err
+	leaseName := cleanKey(key, leasePrefix)
+	err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Delete(ctx, leaseName, metav1.DeleteOptions{})
+	if err != nil {
+		s.logger.Error("failed to release storage lock", zap.String("lock", leaseName), zap.Error(err))
+		return err
+	}
+	s.logger.Debug("storage lock released", zap.String("lock", leaseName))
+	return nil
 }
