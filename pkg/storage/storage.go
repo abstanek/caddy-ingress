@@ -35,6 +35,15 @@ var (
 // another instance (a different LeaseID).
 var errLockHeld = errors.New("lock is held by another instance")
 
+// lockAcquireTimeout is how long Lock waits for a contended lock before
+// giving up. Certificate issuance legitimately holds a lock for the length
+// of an ACME transaction, so the timeout is generous -- but it must exist:
+// certmagic deduplicates renewal jobs per domain, so a waiter that never
+// returns blocks every future renewal of that domain in this process. On
+// timeout the caller's operation fails visibly and certmagic retries it
+// later. A variable so tests can shorten it.
+var lockAcquireTimeout = 5 * time.Minute
+
 const (
 	leasePrefix = "caddy-lock-"
 
@@ -236,6 +245,13 @@ func (s *SecretStorage) Lock(ctx context.Context, key string) error {
 			logger.Debug("storage lock acquired", zap.Duration("waited", time.Since(start)))
 			go s.keepLockUpdated(ctx, leaseName)
 			return nil
+		}
+
+		if time.Since(start) >= lockAcquireTimeout {
+			logger.Error("giving up on storage lock: timeout",
+				zap.Error(err),
+				zap.Duration("waited", time.Since(start)))
+			return fmt.Errorf("timed out waiting for lock %v: %w", leaseName, err)
 		}
 
 		logger.Warn("storage lock not acquired; will retry",

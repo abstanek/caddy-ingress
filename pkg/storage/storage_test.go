@@ -304,3 +304,38 @@ func TestUnlockDeletesLeaseEvenWithCanceledContext(t *testing.T) {
 		t.Fatalf("lease still exists after Unlock: err = %v", err)
 	}
 }
+
+func TestLockAcquiresFreeLock(t *testing.T) {
+	s := newTestStorage(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := "issue_cert_example.com"
+
+	if err := s.Lock(ctx, key); err != nil {
+		t.Fatalf("Lock on free lock: %v", err)
+	}
+	if err := s.Unlock(ctx, key); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+}
+
+func TestLockTimesOutOnHeldLock(t *testing.T) {
+	old := lockAcquireTimeout
+	lockAcquireTimeout = 0 // give up after the first failed attempt
+	defer func() { lockAcquireTimeout = old }()
+
+	s := newTestStorage(t)
+	ctx := context.Background()
+	key := "issue_cert_example.com"
+	leaseName := cleanKey(key, leasePrefix)
+
+	_, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Create(ctx, otherHolderLease(leaseName, s.Namespace, false), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating fixture lease: %v", err)
+	}
+
+	err = s.Lock(ctx, key)
+	if !errors.Is(err, errLockHeld) {
+		t.Fatalf("Lock on held lock: err = %v, want errLockHeld after timeout", err)
+	}
+}
