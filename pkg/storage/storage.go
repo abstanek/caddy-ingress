@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -14,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -22,13 +23,38 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-const (
+// Lease timing values are variables (not constants) only so tests can
+// shorten them.
+var (
 	leaseDuration      = 5 * time.Second
 	leaseRenewInterval = 2 * time.Second
 	leasePollInterval  = 5 * time.Second
-	leasePrefix        = "caddy-lock-"
+)
+
+// errLockHeld reports that a lock lease exists and is actively held by
+// another instance (a different LeaseID).
+var errLockHeld = errors.New("lock is held by another instance")
+
+// lockAcquireTimeout is how long Lock waits for a contended lock before
+// giving up. Certificate issuance legitimately holds a lock for the length
+// of an ACME transaction, so the timeout is generous -- but it must exist:
+// certmagic deduplicates renewal jobs per domain, so a waiter that never
+// returns blocks every future renewal of that domain in this process. On
+// timeout the caller's operation fails visibly and certmagic retries it
+// later. A variable so tests can shorten it.
+var lockAcquireTimeout = 5 * time.Minute
+
+const (
+	leasePrefix = "caddy-lock-"
 
 	keyPrefix = "caddy.ingress--"
+
+	// kubeAPITimeout bounds every kubernetes API request made by this
+	// storage adapter. Without it, a wedged connection to the API server
+	// makes certificate loads, stores, and lock operations block forever
+	// with no error and no log line, which silently disables certificate
+	// renewal until the pod is replaced.
+	kubeAPITimeout = 30 * time.Second
 )
 
 // matchLabels are attached to each resource so that they can be found in the future.
@@ -50,7 +76,8 @@ type SecretStorage struct {
 	Namespace string
 	LeaseID   string
 
-	kubeClient *kubernetes.Clientset
+	// kubeClient is the interface type so tests can substitute a fake clientset.
+	kubeClient kubernetes.Interface
 	logger     *zap.Logger
 }
 
@@ -67,9 +94,16 @@ func (SecretStorage) CaddyModule() caddy.ModuleInfo {
 
 // Provisions the SecretStorage instance.
 func (s *SecretStorage) Provision(ctx caddy.Context) error {
-	config, _ := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
-	// creates the clientset
-	clientset, _ := kubernetes.NewForConfig(config)
+	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+	if err != nil {
+		return fmt.Errorf("building kubernetes client config: %v", err)
+	}
+	config.Timeout = kubeAPITimeout
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("creating kubernetes client: %v", err)
+	}
 
 	s.logger = ctx.Logger(s)
 	s.kubeClient = clientset
@@ -86,24 +120,15 @@ func (s *SecretStorage) CertMagicStorage() (certmagic.Storage, error) {
 
 // Exists returns true if key exists in fs.
 func (s *SecretStorage) Exists(ctx context.Context, key string) bool {
-	s.logger.Debug("finding secret", zap.String("name", key))
-	secrets, err := s.kubeClient.CoreV1().Secrets(s.Namespace).List(context.TODO(), metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("metadata.name=%v", cleanKey(key, keyPrefix)),
-	})
-
-	if err != nil {
-		return false
+	name := cleanKey(key, keyPrefix)
+	s.logger.Debug("finding secret", zap.String("name", name))
+	_, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		// The certmagic interface gives Exists no way to report an error, so
+		// log it; treating the key as absent is the only option here.
+		s.logger.Error("failed to check secret existence", zap.String("name", name), zap.Error(err))
 	}
-
-	var found bool
-	for _, i := range secrets.Items {
-		if i.ObjectMeta.Name == cleanKey(key, keyPrefix) {
-			found = true
-			break
-		}
-	}
-
-	return found
+	return err == nil
 }
 
 // Store saves value at key. More than certs and keys are stored by certmagic in secrets.
@@ -118,16 +143,18 @@ func (s *SecretStorage) Store(ctx context.Context, key string, value []byte) err
 		},
 	}
 
-	var err error
-	if s.Exists(ctx, key) {
-		s.logger.Debug("creating secret", zap.String("name", key))
-		_, err = s.kubeClient.CoreV1().Secrets(s.Namespace).Update(context.TODO(), &se, metav1.UpdateOptions{})
-	} else {
-		s.logger.Debug("updating secret", zap.String("name", key))
-		_, err = s.kubeClient.CoreV1().Secrets(s.Namespace).Create(context.TODO(), &se, metav1.CreateOptions{})
+	// Try to create first and fall back to an update: unlike an existence
+	// pre-check, this cannot be misled by a failed read, and the update
+	// (with no resourceVersion, i.e. an unconditional replace) keeps working
+	// if the secret appeared in the meantime.
+	s.logger.Debug("creating secret", zap.String("name", se.Name))
+	_, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Create(ctx, &se, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		s.logger.Debug("updating secret", zap.String("name", se.Name))
+		_, err = s.kubeClient.CoreV1().Secrets(s.Namespace).Update(ctx, &se, metav1.UpdateOptions{})
 	}
-
 	if err != nil {
+		s.logger.Error("failed to store secret", zap.String("name", se.Name), zap.Error(err))
 		return err
 	}
 
@@ -136,9 +163,9 @@ func (s *SecretStorage) Store(ctx context.Context, key string, value []byte) err
 
 // Load retrieves the value at the given key.
 func (s *SecretStorage) Load(ctx context.Context, key string) ([]byte, error) {
-	secret, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(context.TODO(), cleanKey(key, keyPrefix), metav1.GetOptions{})
+	secret, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(ctx, cleanKey(key, keyPrefix), metav1.GetOptions{})
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil, fs.ErrNotExist
 		}
 		return nil, err
@@ -150,7 +177,7 @@ func (s *SecretStorage) Load(ctx context.Context, key string) ([]byte, error) {
 
 // Delete deletes the value at the given key.
 func (s *SecretStorage) Delete(ctx context.Context, key string) error {
-	err := s.kubeClient.CoreV1().Secrets(s.Namespace).Delete(context.TODO(), cleanKey(key, keyPrefix), metav1.DeleteOptions{})
+	err := s.kubeClient.CoreV1().Secrets(s.Namespace).Delete(ctx, cleanKey(key, keyPrefix), metav1.DeleteOptions{})
 	if err != nil {
 		return err
 	}
@@ -164,7 +191,7 @@ func (s *SecretStorage) List(ctx context.Context, prefix string, recursive bool)
 	var keys []string
 
 	s.logger.Debug("listing secrets", zap.String("name", prefix))
-	secrets, err := s.kubeClient.CoreV1().Secrets(s.Namespace).List(context.TODO(), metav1.ListOptions{
+	secrets, err := s.kubeClient.CoreV1().Secrets(s.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(matchLabels).String(),
 	})
 	if err != nil {
@@ -184,7 +211,7 @@ func (s *SecretStorage) List(ctx context.Context, prefix string, recursive bool)
 
 // Stat returns information about key.
 func (s *SecretStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	secret, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(context.TODO(), cleanKey(key, keyPrefix), metav1.GetOptions{})
+	secret, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(ctx, cleanKey(key, keyPrefix), metav1.GetOptions{})
 	if err != nil {
 		return certmagic.KeyInfo{}, err
 	}
@@ -200,29 +227,73 @@ func (s *SecretStorage) Stat(ctx context.Context, key string) (certmagic.KeyInfo
 }
 
 func (s *SecretStorage) Lock(ctx context.Context, key string) error {
+	leaseName := cleanKey(key, leasePrefix)
+	logger := s.logger.With(zap.String("lock", leaseName))
+	logger.Debug("acquiring storage lock")
+
+	start := time.Now()
 	for {
-		_, err := s.tryAcquireOrRenew(ctx, cleanKey(key, leasePrefix), false)
+		_, err := s.tryAcquireOrRenew(ctx, leaseName, false)
 		if err == nil {
-			go s.keepLockUpdated(ctx, cleanKey(key, leasePrefix))
+			logger.Debug("storage lock acquired", zap.Duration("waited", time.Since(start)))
+			go s.keepLockUpdated(ctx, leaseName)
 			return nil
 		}
+
+		if time.Since(start) >= lockAcquireTimeout {
+			logger.Error("giving up on storage lock: timeout",
+				zap.Error(err),
+				zap.Duration("waited", time.Since(start)))
+			return fmt.Errorf("timed out waiting for lock %v: %w", leaseName, err)
+		}
+
+		logger.Warn("storage lock not acquired; will retry",
+			zap.Error(err),
+			zap.Duration("waited", time.Since(start)))
 
 		select {
 		case <-time.After(leasePollInterval):
 		case <-ctx.Done():
+			logger.Warn("giving up on storage lock: context done",
+				zap.Duration("waited", time.Since(start)))
 			return ctx.Err()
 		}
 	}
 }
 
 func (s *SecretStorage) keepLockUpdated(ctx context.Context, key string) {
+	logger := s.logger.With(zap.String("lock", key))
 	for {
-		time.Sleep(leaseRenewInterval)
+		select {
+		case <-ctx.Done():
+			logger.Debug("stopping storage lock refresh: context done")
+			return
+		case <-time.After(leaseRenewInterval):
+		}
+
 		done, err := s.tryAcquireOrRenew(ctx, key, true)
 		if err != nil {
-			return
+			if ctx.Err() != nil {
+				logger.Debug("stopping storage lock refresh: context done")
+				return
+			}
+			if errors.Is(err, errLockHeld) {
+				// Our lease expired and another instance took it over. The
+				// operation this lock protected is still running here, so
+				// mutual exclusion is compromised; all we can do is say so
+				// loudly and stop refreshing a lease we no longer own.
+				logger.Error("storage lock lost to another instance; stopping refresh", zap.Error(err))
+				return
+			}
+			// A transient API failure must not stop the refresh loop: the
+			// lease would expire a few seconds later and another instance
+			// could acquire the lock while the operation protected by it is
+			// still running here.
+			logger.Warn("failed to refresh storage lock; will retry", zap.Error(err))
+			continue
 		}
 		if done {
+			logger.Debug("storage lock released; stopping refresh")
 			return
 		}
 	}
@@ -252,7 +323,7 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 
 	// 1. obtain or create the ElectionRecord
 	if err != nil {
-		if !errors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
 			return true, err
 		}
 		if shouldExist {
@@ -268,7 +339,7 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 	if currLer.HolderIdentity != "" &&
 		currLer.RenewTime.Add(leaseDuration).After(now.Time) &&
 		currLer.HolderIdentity != lock.Identity() {
-		return true, fmt.Errorf("lock is held by %v and has not yet expired", currLer.HolderIdentity)
+		return true, fmt.Errorf("%w: held by %v and not yet expired", errLockHeld, currLer.HolderIdentity)
 	}
 
 	// 3. We're going to try to update the existing one
@@ -286,6 +357,17 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 }
 
 func (s *SecretStorage) Unlock(ctx context.Context, key string) error {
-	err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Delete(context.TODO(), cleanKey(key, leasePrefix), metav1.DeleteOptions{})
-	return err
+	// The lease must be deleted even if the operation that held the lock was
+	// canceled (e.g. by a config reload), otherwise the lease is orphaned and
+	// outlives its holder. The request is still bounded by the client's
+	// request timeout.
+	ctx = context.WithoutCancel(ctx)
+	leaseName := cleanKey(key, leasePrefix)
+	err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Delete(ctx, leaseName, metav1.DeleteOptions{})
+	if err != nil {
+		s.logger.Error("failed to release storage lock", zap.String("lock", leaseName), zap.Error(err))
+		return err
+	}
+	s.logger.Debug("storage lock released", zap.String("lock", leaseName))
+	return nil
 }
