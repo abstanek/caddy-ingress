@@ -50,7 +50,8 @@ type SecretStorage struct {
 	Namespace string
 	LeaseID   string
 
-	kubeClient *kubernetes.Clientset
+	// kubeClient is the interface type so tests can substitute a fake clientset.
+	kubeClient kubernetes.Interface
 	logger     *zap.Logger
 }
 
