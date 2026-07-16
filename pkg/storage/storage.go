@@ -287,6 +287,28 @@ func (s *SecretStorage) Lock(ctx context.Context, key string) error {
 	}
 }
 
+// TryLock attempts to acquire the lock for key without blocking, reporting
+// whether it was acquired. certmagic prefers this over Lock for background
+// synchronization (e.g. ARI refreshes in the maintenance loop) where waiting
+// on a busy lock is worse than skipping the work until the next cycle.
+func (s *SecretStorage) TryLock(ctx context.Context, key string) (bool, error) {
+	leaseName := cleanKey(key, leasePrefix)
+	logger := s.logger.With(zap.String("lock", leaseName))
+
+	_, err := s.tryAcquireOrRenew(ctx, leaseName, false)
+	if errors.Is(err, errLockHeld) || apierrors.IsAlreadyExists(err) {
+		logger.Debug("storage lock busy; not waiting")
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	logger.Debug("storage lock acquired without waiting")
+	go s.keepLockUpdated(ctx, leaseName)
+	return true, nil
+}
+
 func (s *SecretStorage) keepLockUpdated(ctx context.Context, key string) {
 	logger := s.logger.With(zap.String("lock", key))
 	for {
@@ -397,3 +419,9 @@ func (s *SecretStorage) Unlock(ctx context.Context, key string) error {
 	s.logger.Debug("storage lock released", zap.String("lock", leaseName))
 	return nil
 }
+
+// Interface guards
+var (
+	_ certmagic.Storage   = (*SecretStorage)(nil)
+	_ certmagic.TryLocker = (*SecretStorage)(nil)
+)

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,17 @@ func newTestStorage(t *testing.T) *SecretStorage {
 		kubeClient: fake.NewClientset(),
 		logger:     zaptest.NewLogger(t),
 	}
+}
+
+// newQuietTestStorage is for tests that spawn the background lock-refresh
+// goroutine (Lock/TryLock success paths): the goroutine may log after the
+// test returns, which the zaptest logger treats as a fatal error, so these
+// tests use a no-op logger instead.
+func newQuietTestStorage(t *testing.T) *SecretStorage {
+	t.Helper()
+	s := newTestStorage(t)
+	s.logger = zap.NewNop()
+	return s
 }
 
 func TestStoreLoadRoundtrip(t *testing.T) {
@@ -308,7 +320,7 @@ func TestUnlockDeletesLeaseEvenWithCanceledContext(t *testing.T) {
 }
 
 func TestLockAcquiresFreeLock(t *testing.T) {
-	s := newTestStorage(t)
+	s := newQuietTestStorage(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	key := "issue_cert_example.com"
@@ -448,5 +460,32 @@ func TestLockFailsFastOnValidationError(t *testing.T) {
 	// Must fail on the first attempt, not after retries/timeouts.
 	if elapsed := time.Since(start); elapsed > leasePollInterval {
 		t.Fatalf("Lock took %v to fail; expected immediate failure", elapsed)
+	}
+}
+
+func TestTryLock(t *testing.T) {
+	s := newQuietTestStorage(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := "ari_someCertificateID"
+
+	ok, err := s.TryLock(ctx, key)
+	if err != nil || !ok {
+		t.Fatalf("TryLock on free lock = (%v, %v), want (true, nil)", ok, err)
+	}
+	if err := s.Unlock(ctx, key); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+
+	// Held by another instance: must report busy without error and without
+	// blocking.
+	leaseName := cleanKey(key, leasePrefix)
+	_, err = s.kubeClient.CoordinationV1().Leases(s.Namespace).Create(ctx, otherHolderLease(leaseName, s.Namespace, false), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating fixture lease: %v", err)
+	}
+	ok, err = s.TryLock(ctx, key)
+	if err != nil || ok {
+		t.Fatalf("TryLock on held lock = (%v, %v), want (false, nil)", ok, err)
 	}
 }
