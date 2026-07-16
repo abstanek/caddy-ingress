@@ -120,24 +120,15 @@ func (s *SecretStorage) CertMagicStorage() (certmagic.Storage, error) {
 
 // Exists returns true if key exists in fs.
 func (s *SecretStorage) Exists(ctx context.Context, key string) bool {
-	s.logger.Debug("finding secret", zap.String("name", key))
-	secrets, err := s.kubeClient.CoreV1().Secrets(s.Namespace).List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("metadata.name=%v", cleanKey(key, keyPrefix)),
-	})
-
-	if err != nil {
-		return false
+	name := cleanKey(key, keyPrefix)
+	s.logger.Debug("finding secret", zap.String("name", name))
+	_, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		// The certmagic interface gives Exists no way to report an error, so
+		// log it; treating the key as absent is the only option here.
+		s.logger.Error("failed to check secret existence", zap.String("name", name), zap.Error(err))
 	}
-
-	var found bool
-	for _, i := range secrets.Items {
-		if i.ObjectMeta.Name == cleanKey(key, keyPrefix) {
-			found = true
-			break
-		}
-	}
-
-	return found
+	return err == nil
 }
 
 // Store saves value at key. More than certs and keys are stored by certmagic in secrets.
@@ -152,16 +143,18 @@ func (s *SecretStorage) Store(ctx context.Context, key string, value []byte) err
 		},
 	}
 
-	var err error
-	if s.Exists(ctx, key) {
-		s.logger.Debug("creating secret", zap.String("name", key))
+	// Try to create first and fall back to an update: unlike an existence
+	// pre-check, this cannot be misled by a failed read, and the update
+	// (with no resourceVersion, i.e. an unconditional replace) keeps working
+	// if the secret appeared in the meantime.
+	s.logger.Debug("creating secret", zap.String("name", se.Name))
+	_, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Create(ctx, &se, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		s.logger.Debug("updating secret", zap.String("name", se.Name))
 		_, err = s.kubeClient.CoreV1().Secrets(s.Namespace).Update(ctx, &se, metav1.UpdateOptions{})
-	} else {
-		s.logger.Debug("updating secret", zap.String("name", key))
-		_, err = s.kubeClient.CoreV1().Secrets(s.Namespace).Create(ctx, &se, metav1.CreateOptions{})
 	}
-
 	if err != nil {
+		s.logger.Error("failed to store secret", zap.String("name", se.Name), zap.Error(err))
 		return err
 	}
 

@@ -339,3 +339,36 @@ func TestLockTimesOutOnHeldLock(t *testing.T) {
 		t.Fatalf("Lock on held lock: err = %v, want errLockHeld after timeout", err)
 	}
 }
+
+func TestExistsReportsFalseButLogsOnAPIError(t *testing.T) {
+	s := newTestStorage(t)
+	fakeClient := s.kubeClient.(*fake.Clientset)
+	fakeClient.PrependReactor("get", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
+	})
+
+	if s.Exists(context.Background(), "certificates/issuer/example.com/example.com.crt") {
+		t.Fatal("Exists = true when the API call failed")
+	}
+}
+
+func TestStoreUpdatesWhenCreateConflicts(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	key := "certificates/issuer/example.com/example.com.crt"
+
+	// Seed the secret out-of-band so Store's Create hits AlreadyExists.
+	if err := s.Store(ctx, key, []byte("old")); err != nil {
+		t.Fatalf("seed Store: %v", err)
+	}
+	if err := s.Store(ctx, key, []byte("new")); err != nil {
+		t.Fatalf("Store over existing secret: %v", err)
+	}
+	got, err := s.Load(ctx, key)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("Load = %q, want %q", got, "new")
+	}
+}
