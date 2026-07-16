@@ -29,6 +29,13 @@ const (
 	leasePrefix        = "caddy-lock-"
 
 	keyPrefix = "caddy.ingress--"
+
+	// kubeAPITimeout bounds every kubernetes API request made by this
+	// storage adapter. Without it, a wedged connection to the API server
+	// makes certificate loads, stores, and lock operations block forever
+	// with no error and no log line, which silently disables certificate
+	// renewal until the pod is replaced.
+	kubeAPITimeout = 30 * time.Second
 )
 
 // matchLabels are attached to each resource so that they can be found in the future.
@@ -68,9 +75,16 @@ func (SecretStorage) CaddyModule() caddy.ModuleInfo {
 
 // Provisions the SecretStorage instance.
 func (s *SecretStorage) Provision(ctx caddy.Context) error {
-	config, _ := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
-	// creates the clientset
-	clientset, _ := kubernetes.NewForConfig(config)
+	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+	if err != nil {
+		return fmt.Errorf("building kubernetes client config: %v", err)
+	}
+	config.Timeout = kubeAPITimeout
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("creating kubernetes client: %v", err)
+	}
 
 	s.logger = ctx.Logger(s)
 	s.kubeClient = clientset
