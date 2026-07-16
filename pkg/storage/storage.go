@@ -65,10 +65,27 @@ var matchLabels = map[string]string{
 // specialChars is a regex that matches all special characters except '-'.
 var specialChars = regexp.MustCompile(`[^\da-zA-Z-]+`)
 
-// cleanKey strips all special characters that are not supported by kubernetes names and converts them to a '.'.
-// sequences like '.*.' are also converted to a single '.'.
+// dotDashRuns matches any run of dots and dashes that contains at least one
+// dot. Such runs would produce labels that start or end with '-', which
+// kubernetes rejects.
+var dotDashRuns = regexp.MustCompile(`[.-]*\.[.-]*`)
+
+// cleanKey converts a certmagic storage key into a valid kubernetes object
+// name: a lowercase RFC 1123 subdomain (lowercase alphanumerics, '-' and
+// '.', starting and ending with an alphanumeric). Runs of unsupported
+// characters become a single '.', everything is lowercased (certmagic keys
+// can carry mixed-case data, e.g. base64url ARI certificate IDs in lock
+// names), and leading/trailing separators are trimmed.
+//
+// Distinct keys that differ only in case or separators map to the same
+// name; for the keys certmagic actually generates (lowercase domains,
+// issuer paths, lock names) this does not collide in practice.
 func cleanKey(key string, prefix string) string {
-	return prefix + specialChars.ReplaceAllString(key, ".")
+	clean := strings.ToLower(specialChars.ReplaceAllString(key, "."))
+	clean = dotDashRuns.ReplaceAllString(clean, ".")
+	clean = strings.Trim(clean, ".")
+	clean = strings.TrimRight(clean, "-")
+	return prefix + clean
 }
 
 // SecretStorage facilitates storing certificates retrieved by certmagic in kubernetes secrets.

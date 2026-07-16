@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -370,5 +371,56 @@ func TestStoreUpdatesWhenCreateConflicts(t *testing.T) {
 	}
 	if string(got) != "new" {
 		t.Fatalf("Load = %q, want %q", got, "new")
+	}
+}
+
+func TestCleanKeyProducesValidKubernetesNames(t *testing.T) {
+	cases := []struct {
+		key    string
+		prefix string
+		want   string
+	}{
+		// An ARI lock key with the same shape as the one behind the July
+		// renewal outage (the ID here is synthetic): certmagic locks ARI
+		// refreshes with "ari_" + the ARI certificate ID, which is
+		// mixed-case base64url. The apiserver rejected the uppercase lease
+		// name, and renewal maintenance hung forever retrying it.
+		{
+			key:    "ari_aA1aA1aA1aA1aA1_Aa1Aa1Aa1Aa.A1aA1aA1aA1aA1aA1aA1aA1a",
+			prefix: leasePrefix,
+			want:   "caddy-lock-ari.aa1aa1aa1aa1aa1.aa1aa1aa1aa.a1aa1aa1aa1aa1aa1aa1aa1a",
+		},
+		// Empty ARI ID must not leave a trailing separator.
+		{key: "ari_", prefix: leasePrefix, want: "caddy-lock-ari"},
+		// Ordinary issuance lock and cert resource keys are unchanged.
+		{
+			key:    "issue_cert_example-1.cloud",
+			prefix: leasePrefix,
+			want:   "caddy-lock-issue.cert.example-1.cloud",
+		},
+		{
+			key:    "certificates/acme-v02.api.letsencrypt.org-directory/example-2.com/example-2.com.crt",
+			prefix: keyPrefix,
+			want:   "caddy.ingress--certificates.acme-v02.api.letsencrypt.org-directory.example-2.com.example-2.com.crt",
+		},
+		// Wildcard storage keys ("*." becomes "wildcard_." in certmagic).
+		{
+			key:    "issue_cert_*.example.com",
+			prefix: leasePrefix,
+			want:   "caddy-lock-issue.cert.example.com",
+		},
+		// A dash adjacent to a replaced character must not produce a label
+		// that starts or ends with '-' (base64url IDs can contain "_-").
+		{key: "ari_ab-_cd_-ef", prefix: leasePrefix, want: "caddy-lock-ari.ab.cd.ef"},
+	}
+
+	for _, tc := range cases {
+		got := cleanKey(tc.key, tc.prefix)
+		if got != tc.want {
+			t.Errorf("cleanKey(%q, %q) = %q, want %q", tc.key, tc.prefix, got, tc.want)
+		}
+		if errs := validation.IsDNS1123Subdomain(got); len(errs) != 0 {
+			t.Errorf("cleanKey(%q, %q) = %q is not a valid kubernetes name: %v", tc.key, tc.prefix, got, errs)
+		}
 	}
 }
