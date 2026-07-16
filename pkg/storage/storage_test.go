@@ -5,9 +5,15 @@ import (
 	"errors"
 	"io/fs"
 	"testing"
+	"time"
 
 	"go.uber.org/zap/zaptest"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // newTestStorage returns a SecretStorage backed by an in-memory fake
@@ -113,5 +119,188 @@ func TestListByPrefix(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("List(certificates) returned %d keys (%v), want 2", len(got), got)
+	}
+}
+
+// otherHolderLease returns a lease for leaseName held by a different
+// instance, whose renewTime makes it expired or not as requested.
+func otherHolderLease(leaseName, namespace string, expired bool) *coordinationv1.Lease {
+	renewTime := metav1.NewMicroTime(time.Now())
+	if expired {
+		renewTime = metav1.NewMicroTime(time.Now().Add(-time.Minute))
+	}
+	holder := "other-instance"
+	seconds := int32(5)
+	return &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leaseName, Namespace: namespace},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &seconds,
+			AcquireTime:          &renewTime,
+			RenewTime:            &renewTime,
+		},
+	}
+}
+
+func TestTryAcquireCreatesLease(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+
+	if _, err := s.tryAcquireOrRenew(ctx, "caddy-lock-issue.cert.example.com", false); err != nil {
+		t.Fatalf("tryAcquireOrRenew on free lock: %v", err)
+	}
+	lease, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Get(ctx, "caddy-lock-issue.cert.example.com", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("lease not created: %v", err)
+	}
+	if *lease.Spec.HolderIdentity != s.LeaseID {
+		t.Fatalf("lease holder = %q, want %q", *lease.Spec.HolderIdentity, s.LeaseID)
+	}
+}
+
+func TestTryAcquireHeldLockReturnsErrLockHeld(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	leaseName := "caddy-lock-issue.cert.example.com"
+
+	_, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Create(ctx, otherHolderLease(leaseName, s.Namespace, false), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating fixture lease: %v", err)
+	}
+
+	if _, err := s.tryAcquireOrRenew(ctx, leaseName, false); !errors.Is(err, errLockHeld) {
+		t.Fatalf("tryAcquireOrRenew on held lock: err = %v, want errLockHeld", err)
+	}
+}
+
+func TestTryAcquireTakesOverExpiredLease(t *testing.T) {
+	s := newTestStorage(t)
+	ctx := context.Background()
+	leaseName := "caddy-lock-issue.cert.example.com"
+
+	_, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Create(ctx, otherHolderLease(leaseName, s.Namespace, true), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating fixture lease: %v", err)
+	}
+
+	if _, err := s.tryAcquireOrRenew(ctx, leaseName, false); err != nil {
+		t.Fatalf("tryAcquireOrRenew on expired lock: %v", err)
+	}
+	lease, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Get(ctx, leaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get lease: %v", err)
+	}
+	if *lease.Spec.HolderIdentity != s.LeaseID {
+		t.Fatalf("lease holder after takeover = %q, want %q", *lease.Spec.HolderIdentity, s.LeaseID)
+	}
+}
+
+func TestKeepLockUpdatedSurvivesTransientError(t *testing.T) {
+	old := leaseRenewInterval
+	leaseRenewInterval = 5 * time.Millisecond
+
+	s := newTestStorage(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	leaseName := "caddy-lock-issue.cert.example.com"
+
+	if _, err := s.tryAcquireOrRenew(ctx, leaseName, false); err != nil {
+		t.Fatalf("acquiring lock: %v", err)
+	}
+
+	// Fail the next single lease GET with a server error; afterwards the
+	// refresh loop must keep renewing rather than exit.
+	failures := 1
+	fakeClient := s.kubeClient.(*fake.Clientset)
+	fakeClient.PrependReactor("get", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if failures > 0 {
+			failures--
+			return true, nil, apierrors.NewInternalError(errors.New("transient"))
+		}
+		return false, nil, nil
+	})
+
+	refreshStopped := make(chan struct{})
+	go func() {
+		s.keepLockUpdated(ctx, leaseName)
+		close(refreshStopped)
+	}()
+	defer func() {
+		// The refresh goroutine must be stopped before the interval is
+		// restored, or the write races with the goroutine's reads.
+		cancel()
+		<-refreshStopped
+		leaseRenewInterval = old
+	}()
+
+	// Wait for several refresh intervals, then verify the lease renewTime
+	// advanced past the acquisition time (the loop outlived the error). The
+	// polling below uses List rather than Get so it does not trip the
+	// injected reactor, which only the refresh loop should consume.
+	deadline := time.Now().Add(2 * time.Second)
+	acquired := time.Now()
+	for time.Now().Before(deadline) {
+		leases, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).List(context.Background(), metav1.ListOptions{})
+		if err == nil {
+			for _, lease := range leases.Items {
+				if lease.Name == leaseName && lease.Spec.RenewTime != nil && lease.Spec.RenewTime.After(acquired) {
+					return // renewed after the transient failure
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("lease was never renewed after a transient error; refresh loop stopped")
+}
+
+func TestKeepLockUpdatedStopsWhenLockLost(t *testing.T) {
+	old := leaseRenewInterval
+	leaseRenewInterval = 5 * time.Millisecond
+
+	s := newTestStorage(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	leaseName := "caddy-lock-issue.cert.example.com"
+
+	// The lease is held by another, unexpired instance: refresh must stop.
+	_, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Create(ctx, otherHolderLease(leaseName, s.Namespace, false), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating fixture lease: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.keepLockUpdated(ctx, leaseName)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+		leaseRenewInterval = old
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepLockUpdated did not stop after losing the lock")
+	}
+}
+
+func TestUnlockDeletesLeaseEvenWithCanceledContext(t *testing.T) {
+	s := newTestStorage(t)
+	key := "issue_cert_example.com"
+	leaseName := cleanKey(key, leasePrefix)
+
+	if _, err := s.tryAcquireOrRenew(context.Background(), leaseName, false); err != nil {
+		t.Fatalf("acquiring lock: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the operation holding the lock was canceled
+	if err := s.Unlock(ctx, key); err != nil {
+		t.Fatalf("Unlock with canceled context: %v", err)
+	}
+
+	_, err := s.kubeClient.CoordinationV1().Leases(s.Namespace).Get(context.Background(), leaseName, metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("lease still exists after Unlock: err = %v", err)
 	}
 }

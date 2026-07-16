@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -14,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -22,11 +23,20 @@ import (
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
-const (
+// Lease timing values are variables (not constants) only so tests can
+// shorten them.
+var (
 	leaseDuration      = 5 * time.Second
 	leaseRenewInterval = 2 * time.Second
 	leasePollInterval  = 5 * time.Second
-	leasePrefix        = "caddy-lock-"
+)
+
+// errLockHeld reports that a lock lease exists and is actively held by
+// another instance (a different LeaseID).
+var errLockHeld = errors.New("lock is held by another instance")
+
+const (
+	leasePrefix = "caddy-lock-"
 
 	keyPrefix = "caddy.ingress--"
 
@@ -153,7 +163,7 @@ func (s *SecretStorage) Store(ctx context.Context, key string, value []byte) err
 func (s *SecretStorage) Load(ctx context.Context, key string) ([]byte, error) {
 	secret, err := s.kubeClient.CoreV1().Secrets(s.Namespace).Get(ctx, cleanKey(key, keyPrefix), metav1.GetOptions{})
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			return nil, fs.ErrNotExist
 		}
 		return nil, err
@@ -245,11 +255,33 @@ func (s *SecretStorage) Lock(ctx context.Context, key string) error {
 func (s *SecretStorage) keepLockUpdated(ctx context.Context, key string) {
 	logger := s.logger.With(zap.String("lock", key))
 	for {
-		time.Sleep(leaseRenewInterval)
+		select {
+		case <-ctx.Done():
+			logger.Debug("stopping storage lock refresh: context done")
+			return
+		case <-time.After(leaseRenewInterval):
+		}
+
 		done, err := s.tryAcquireOrRenew(ctx, key, true)
 		if err != nil {
-			logger.Warn("stopping storage lock refresh due to error", zap.Error(err))
-			return
+			if ctx.Err() != nil {
+				logger.Debug("stopping storage lock refresh: context done")
+				return
+			}
+			if errors.Is(err, errLockHeld) {
+				// Our lease expired and another instance took it over. The
+				// operation this lock protected is still running here, so
+				// mutual exclusion is compromised; all we can do is say so
+				// loudly and stop refreshing a lease we no longer own.
+				logger.Error("storage lock lost to another instance; stopping refresh", zap.Error(err))
+				return
+			}
+			// A transient API failure must not stop the refresh loop: the
+			// lease would expire a few seconds later and another instance
+			// could acquire the lock while the operation protected by it is
+			// still running here.
+			logger.Warn("failed to refresh storage lock; will retry", zap.Error(err))
+			continue
 		}
 		if done {
 			logger.Debug("storage lock released; stopping refresh")
@@ -282,7 +314,7 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 
 	// 1. obtain or create the ElectionRecord
 	if err != nil {
-		if !errors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
 			return true, err
 		}
 		if shouldExist {
@@ -298,7 +330,7 @@ func (s *SecretStorage) tryAcquireOrRenew(ctx context.Context, key string, shoul
 	if currLer.HolderIdentity != "" &&
 		currLer.RenewTime.Add(leaseDuration).After(now.Time) &&
 		currLer.HolderIdentity != lock.Identity() {
-		return true, fmt.Errorf("lock is held by %v and has not yet expired", currLer.HolderIdentity)
+		return true, fmt.Errorf("%w: held by %v and not yet expired", errLockHeld, currLer.HolderIdentity)
 	}
 
 	// 3. We're going to try to update the existing one
